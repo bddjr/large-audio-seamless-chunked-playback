@@ -99,7 +99,7 @@ MP3 每帧的频谱数据依赖前面几帧（比特池）。直接按字节切�
 
 ```powershell
 python duration.py                        # 读同目录的 input.mp3
-python duration.py output-chunks\3.mp3    # 读指定文件
+python duration.py output-chunks/3.mp3    # 读指定文件
 ```
 
 输出秒数，保留三位小数，例如 `473.125`。
@@ -110,7 +110,7 @@ MP3 优先用 `ffprobe` 的时长；但切出来的小块往往没有时长索�
 
 ## 常见问题
 
-- **`找不到源文件: …\input.mp3`**：确认源文件就叫 `input.mp3`，且和脚本在同一目录。
+- **`找不到源文件: …/input.mp3`**：确认源文件就叫 `input.mp3`，且和脚本在同一目录。
 - **`命令失败: ffmpeg …`**：多半是 `ffmpeg` 不在 `PATH`，或输出文件被别的程序占用。
 - **块数和 `.sb3` 对不上**：改 `SECONDS_PER_CHUNK` 或换了更长的歌之后，`sb3` 里的声音数量要一起改。
 - **想省空间**：`temp/` 是纯中间产物，删掉下次运行会重新生成（但会重新解码一遍）。
