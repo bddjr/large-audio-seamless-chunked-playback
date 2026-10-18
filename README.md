@@ -119,3 +119,4 @@ MP3 优先用 `ffprobe` 的时长；但切出来的小块往往没有时长索�
 
 - `大音频分块无缝播放.sb3`：由作者 半岛的蒟蒻bddjr 手动编写。
 - `split.py`、`duration.py`、`README.md`：由 DeepSeek-V4.1-Flash-1017 编写。
+- 音频来自 https://music.163.com/song?id=2114626539
