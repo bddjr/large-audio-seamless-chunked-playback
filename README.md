@@ -18,7 +18,7 @@
 ├─ output-chunks/             # 切块结果：1.mp3、2.mp3、…
 │  └─ 1.mp3 …（数量按大小自动决定，这首 3 块）
 ├─ output-chunks-duration.txt # 每块时长（给 Scratch 列表导入用）
-├─ COPYING                    # 许可证（代码是 Unlicense；input.mp3 版权属于音乐作者）
+├─ COPYING                    # 许可证（代码是 Unlicense；input.mp3 版权不属于本项目）
 ├─ 大音频分块无缝播放.sb3
 └─ README.md
 ```
@@ -173,4 +173,4 @@ python duration.py 别的文件.mp3     # 也可以读别的文件
   （DeepSeek 不知道可以先转 wav 再分块再转 mp3 ，是作者想到了这个办法，然后成功做到无缝播放）
 - `README.md`：主要由 DeepSeek-V4.1-Flash-1017 编写，作者手动修改部分内容。
 - 代码以 Unlicense 发布（见 `COPYING`）。
-- `input.mp3` 来自 <https://music.163.com/song?id=2114626539>，不属于上述许可证的授权范围，版权属于音乐的作者。
+- `input.mp3` 来自 <https://music.163.com/song?id=2114626539>，不属于上述许可证的授权范围；版权不属于本项目的作者。
