@@ -511,6 +511,7 @@ def main(argv=None):
     donor = make_silence_frame(args.silence_bitrate)
     print("2) 编码 MP3（音乐 %s CBR，前导静音 %s）" % (music_bitrate, args.silence_bitrate))
     outs = []
+    sizes = []
     cuts = [0]
     while cuts[-1] < total:
         start = cuts[-1]
@@ -532,6 +533,7 @@ def main(argv=None):
             remove_cache(dst)
             raise
         outs.append(dst)
+        sizes.append(size)
         cuts.append(start + length)
         fill = "，%.1f%% 满" % (100.0 * size / limit) if limit else ""
         print("   %s: 静音 %.3f s + 音乐 %.3f s = %.3f s，%.2f MiB%s（替换 %d 帧静音）"
@@ -550,10 +552,8 @@ def main(argv=None):
     # 3) 校验：解码后的采样数、静音段是否全零、音乐和源 PCM 的误差、块体积
     print("\n3) 校验")
     ok = True
-    total_size = 0
     for k, d in enumerate(outs):
-        size = os.path.getsize(d)
-        total_size += size
+        size = sizes[k]
         samples, want, silent, snr = check_chunk(d, cuts[k], cuts[k + 1], pcm)
         size_ok = size <= cap
         good = samples == want and silent and snr >= 6 and size_ok
@@ -563,8 +563,7 @@ def main(argv=None):
               % (os.path.basename(d), samples, want,
                  "全零" if silent else "有噪声", snr, "OK" if good else "BAD", extra))
     print("   共 %d 块，合计 %.2f MiB，最大一块 %.2f MiB" % (
-        len(outs), total_size / 1048576.0,
-        max(os.path.getsize(d) for d in outs) / 1048576.0))
+        len(outs), sum(sizes) / 1048576.0, max(sizes) / 1048576.0))
 
     print("\n总体:", "通过" if ok else "有问题")
     if not ok:
