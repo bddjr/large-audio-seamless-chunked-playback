@@ -2,7 +2,7 @@
 """大音频分块脚本（按大小填满每块 → 音乐按输入码率编码 + 32 kbps 前导静音）
 
 流程：
-  1. 原音频 → temp/source.wav（解码一次，得到完整 PCM）
+  1. 原音频 → 内存里的 PCM（ffmpeg 管道解码一次，不落 WAV）
   2. 默认按大小切块：一边试编码一边找边界，让每块「前导静音 + 音乐」编码后
      不超过 MAX_CHUNK_BYTES（默认 8 MiB），并且尽量把这一块填满。
      想按固定时长切就用 -s 60（旧行为）。
@@ -53,7 +53,6 @@ import os
 import re
 import subprocess
 import sys
-import wave
 
 # ============ 配置区（默认值，可被命令行参数覆盖） ============
 SRC = "input.mp3"
@@ -96,8 +95,9 @@ def sh(args):
 
 def decode_bytes(path):
     """把音频解码成 s16le / 44.1 kHz / 立体声 的原始字节。"""
-    p = subprocess.run(["ffmpeg", "-v", "error", "-i", path, "-f", "s16le",
-                        "-ac", str(CH), "-ar", str(SR), "-"], capture_output=True)
+    p = subprocess.run(["ffmpeg", "-v", "error", "-i", path, "-map", "0:a:0",
+                        "-f", "s16le", "-ac", str(CH), "-ar", str(SR), "-"],
+                       capture_output=True)
     if p.returncode != 0:
         raise RuntimeError("解码失败: %s\n%s" % (path, p.stderr.decode("utf-8", "replace")))
     return p.stdout[: len(p.stdout) // 2 * 2]
@@ -476,7 +476,6 @@ def main(argv=None):
     out_dir = resolve(args.output_dir)
     temp = resolve(args.temp_dir)
     duration_path = resolve(args.duration_file)
-    src_wav = os.path.join(temp, "source.wav")
     donor_path = os.path.join(temp, "silence.mp3")
     cand_mp3 = os.path.join(temp, "chunk.mp3")
 
@@ -508,19 +507,14 @@ def main(argv=None):
     print("切块: %s，静音 %s，文件名 %s\n"
           % (mode_desc, args.silence_bitrate, args.name_fmt))
 
-    # 1) 解码成 WAV（缓存）
-    print("1) 解码源文件 -> %s" % src_wav)
-    sh(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", src,
-        "-map", "0:a:0", "-c:a", "pcm_s16le", "-ar", str(SR), "-ac", str(CH), src_wav])
-
-    with wave.open(src_wav, "rb") as wf:
-        total = wf.getnframes()
-        pcm = array.array("h")
-        pcm.frombytes(wf.readframes(total))
+    # 1) 解码源文件：PCM 直接走管道读进内存，不落 WAV
+    print("1) 解码源文件（内存管道）")
+    raw = decode_bytes(src)
+    pcm = memoryview(raw).cast("h")
+    total = len(pcm) // CH
     print("   %d 采样，%.3f 秒\n" % (total, total / SR))
 
-    # 整曲 PCM 已经读进内存，source.wav 不再需要了
-    cleaned = 1 if remove_cache(src_wav) else 0
+    cleaned = 0
 
     # 2) 逐块找边界 + 编码 + 替换静音帧
     donor = make_silence_frame(donor_path, args.silence_bitrate)
