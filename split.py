@@ -14,9 +14,7 @@
 
 注意：按大小切块后块数会变（不再固定 8 块），.sb3 里的声音数量要一起改。
 
-缓存：
-      temp/ 里的中间文件在对应的步骤用完后立即删除；全部成功后如果 temp/ 已经空了，
-      连 temp/ 文件夹一起删掉。中途出错时，还没用到的缓存会保留下来，方便排查/重跑。
+过程不写临时文件：PCM 和静音帧都在内存里，MP3 直接编码到 output-chunks/。
 
 为什么音质能和 input.mp3 一样：
       MP3 是有损格式，重新编码不可能逐字节无损；真无损只能用 WAV/FLAC，
@@ -57,7 +55,6 @@ import sys
 # ============ 配置区（默认值，可被命令行参数覆盖） ============
 SRC = "input.mp3"
 OUT_DIR = "output-chunks"
-TEMP_DIR = "temp"
 NAME_FMT = "{0}.mp3"      # {0} 是块序号，从 1 开始（和 Scratch 里默认的声音编号一致）
 # 每块时长的列表文件（给 Scratch 列表导入用），相对脚本目录。
 DURATION_FILE = "output-chunks-duration.txt"
@@ -84,13 +81,6 @@ MP3_SAMPLES = 1152
 BITRATES = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320]
 SAMPLE_RATES = [44100, 48000, 32000]
 SIZE_UNITS = {"": 1, "k": 1024, "m": 1024 ** 2, "g": 1024 ** 3}
-
-
-def sh(args):
-    p = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace")
-    if p.returncode != 0:
-        raise RuntimeError("命令失败: %s\n%s" % (" ".join(args), p.stderr))
-    return p.stdout
 
 
 def decode_bytes(path):
@@ -230,21 +220,36 @@ def auto_music_bitrate(src):
     return "%dk" % nearest_bitrate(target), desc
 
 
-def make_silence_frame(path, bitrate):
-    """生成一帧低码率数字静音，用来替换前面几分钟的静音帧。"""
-    sh(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-        "-f", "lavfi", "-i", "anullsrc=r=%d:cl=stereo" % SR,
-        "-t", "0.2", "-c:a", "libmp3lame", "-b:a", bitrate,
-        "-reservoir", "0", "-ar", str(SR), "-ac", str(CH),
-        "-map_metadata", "-1", "-id3v2_version", "0", "-write_id3v1", "0", path])
-    data = open(path, "rb").read()
+def decode_mp3_data(data):
+    """把 MP3 字节从管道解码成 s16le / 44.1 kHz / 立体声 的原始字节。"""
+    p = subprocess.run(["ffmpeg", "-v", "error", "-f", "mp3", "-i", "pipe:0",
+                        "-f", "s16le", "-ac", str(CH), "-ar", str(SR), "-"],
+                       input=data, capture_output=True)
+    if p.returncode != 0:
+        raise RuntimeError("解码失败: " + p.stderr.decode("utf-8", "replace"))
+    return p.stdout[: len(p.stdout) // 2 * 2]
+
+
+def make_silence_frame(bitrate):
+    """在内存里生成一帧低码率数字静音，用来替换前面几分钟的静音帧。"""
+    p = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error",
+         "-f", "lavfi", "-i", "anullsrc=r=%d:cl=stereo" % SR,
+         "-t", "0.2", "-c:a", "libmp3lame", "-b:a", bitrate,
+         "-reservoir", "0", "-ar", str(SR), "-ac", str(CH),
+         "-map_metadata", "-1", "-id3v2_version", "0", "-write_id3v1", "0",
+         "-f", "mp3", "pipe:1"],
+        capture_output=True)
+    if p.returncode != 0:
+        raise RuntimeError("生成静音帧失败: " + p.stderr.decode("utf-8", "replace"))
+    data = p.stdout
     audio = [f for f in mp3_frames(data) if not f["xing"]]
     if not audio:
-        raise RuntimeError("没能生成静音帧: " + path)
+        raise RuntimeError("没能生成静音帧")
     if any(f["mdb"] != 0 for f in audio):
-        raise RuntimeError("静音帧没有关掉比特池，不能独立解码: " + path)
-    if any(decode_bytes(path)):
-        raise RuntimeError("静音帧解码结果不是全零: " + path)
+        raise RuntimeError("静音帧没有关掉比特池，不能独立解码")
+    if any(decode_mp3_data(data)):
+        raise RuntimeError("静音帧解码结果不是全零")
     f = audio[0]
     return data[f["off"]:f["off"] + f["size"]]
 
@@ -288,10 +293,10 @@ def make_spliced(data, lead, donor):
     return tag + donor * replaced + body, replaced
 
 
-def fit_chunk(pcm, start, remaining, limit, bitrate, donor, tmp_mp3):
-    """在不超过 limit 字节的前提下，找最长的音乐长度并返回 (length, 字节, 替换帧数)。
+def fit_chunk(pcm, start, remaining, limit, bitrate, donor, dst):
+    """在不超过 limit 字节的前提下，找最长的音乐长度，直接写到 dst。
 
-    做法：先按码率估一个长度，试编码，再根据实际大小加/减几帧，直到填得最满。
+    返回 (length, 最终字节数, 替换帧数)。试编码也直接写 dst，最后把拼好的结果写回。
     """
     kbps = int(bitrate.rstrip("k"))
     bytes_per_sec = kbps * 1000.0 / 8
@@ -308,8 +313,8 @@ def fit_chunk(pcm, start, remaining, limit, bitrate, donor, tmp_mp3):
 
     best = None
     for _ in range(6):
-        encode_pcm(padded_pcm(pcm, start, length), tmp_mp3, bitrate)
-        out, replaced = make_spliced(open(tmp_mp3, "rb").read(), start, donor)
+        encode_pcm(padded_pcm(pcm, start, length), dst, bitrate)
+        out, replaced = make_spliced(open(dst, "rb").read(), start, donor)
         size = len(out)
         if size <= limit:
             if best is None or size > best[2]:
@@ -328,7 +333,9 @@ def fit_chunk(pcm, start, remaining, limit, bitrate, donor, tmp_mp3):
     if best is None:
         raise RuntimeError("第 %.1f 秒处放不下一块：%.1f MiB 的限额不够用，曲目太长或码率太高"
                            % (start / SR, limit / 1048576.0))
-    return best
+    with open(dst, "wb") as fh:
+        fh.write(best[1])
+    return best[0], best[2], best[3]
 
 
 def check_chunk(path, lead, music_end, pcm):
@@ -360,7 +367,7 @@ def check_chunk(path, lead, music_end, pcm):
 
 
 def remove_cache(path):
-    """删掉一个不再需要的中间文件；删不掉只警告，不影响结果。返回是否删掉。"""
+    """删掉一个不再需要的文件；删不掉只警告，不影响结果。返回是否删掉。"""
     try:
         os.remove(path)
     except FileNotFoundError:
@@ -387,16 +394,6 @@ def clean_stale_outputs(out_dir, name_fmt, count):
         if (index < 1 or index > count) and remove_cache(os.path.join(out_dir, name)):
             removed += 1
     return removed
-
-
-def prune_empty_dirs(*dirs):
-    """删掉空目录（只删空的）。"""
-    for d in dirs:
-        try:
-            if os.path.isdir(d) and not os.listdir(d):
-                os.rmdir(d)
-        except OSError:
-            pass
 
 
 def parse_size(text):
@@ -437,8 +434,6 @@ def build_parser():
                    help="源音频文件（默认 %(default)s）")
     p.add_argument("-o", "--output-dir", default=OUT_DIR, metavar="目录",
                    help="输出目录（默认 %(default)s）")
-    p.add_argument("-t", "--temp-dir", default=TEMP_DIR, metavar="目录",
-                   help="中间文件目录（默认 %(default)s）")
     p.add_argument("-s", "--seconds-per-chunk", type=int, default=SECONDS_PER_CHUNK,
                    metavar="秒", help="按固定时长切块（不填就按 --max-size 的大小切块）")
     p.add_argument("--max-size", type=size_arg, default=None, metavar="大小",
@@ -474,15 +469,11 @@ def main(argv=None):
 
     src = resolve(args.input)
     out_dir = resolve(args.output_dir)
-    temp = resolve(args.temp_dir)
     duration_path = resolve(args.duration_file)
-    donor_path = os.path.join(temp, "silence.mp3")
-    cand_mp3 = os.path.join(temp, "chunk.mp3")
 
     if not os.path.isfile(src):
         sys.exit("找不到源文件: " + src)
     os.makedirs(out_dir, exist_ok=True)
-    os.makedirs(temp, exist_ok=True)
 
     if args.music_bitrate == "auto":
         music_bitrate, music_note = auto_music_bitrate(src)
@@ -502,7 +493,6 @@ def main(argv=None):
 
     print("输入: %s" % src)
     print("输出: %s" % out_dir)
-    print("临时: %s" % temp)
     print("音乐段: %s（%s）" % (music_bitrate, music_note))
     print("切块: %s，静音 %s，文件名 %s\n"
           % (mode_desc, args.silence_bitrate, args.name_fmt))
@@ -514,27 +504,30 @@ def main(argv=None):
     total = len(pcm) // CH
     print("   %d 采样，%.3f 秒\n" % (total, total / SR))
 
-    cleaned = 0
-
     # 2) 逐块找边界 + 编码 + 替换静音帧
-    donor = make_silence_frame(donor_path, args.silence_bitrate)
+    donor = make_silence_frame(args.silence_bitrate)
     print("2) 编码 MP3（音乐 %s CBR，前导静音 %s）" % (music_bitrate, args.silence_bitrate))
     outs = []
     cuts = [0]
     while cuts[-1] < total:
         start = cuts[-1]
         remaining = total - start
-        if seconds is not None:
-            length = min(seconds * SR, remaining)
-            encode_pcm(padded_pcm(pcm, start, length), cand_mp3, music_bitrate)
-            out, replaced = make_spliced(open(cand_mp3, "rb").read(), start, donor)
-            size = len(out)
-        else:
-            length, out, size, replaced = fit_chunk(
-                pcm, start, remaining, limit, music_bitrate, donor, cand_mp3)
         dst = os.path.join(out_dir, args.name_fmt.format(len(outs) + 1))
-        with open(dst, "wb") as fh:
-            fh.write(out)
+        try:
+            if seconds is not None:
+                length = min(seconds * SR, remaining)
+                encode_pcm(padded_pcm(pcm, start, length), dst, music_bitrate)
+                out, replaced = make_spliced(open(dst, "rb").read(), start, donor)
+                with open(dst, "wb") as fh:
+                    fh.write(out)
+                size = len(out)
+            else:
+                length, size, replaced = fit_chunk(
+                    pcm, start, remaining, limit, music_bitrate, donor, dst)
+        except Exception:
+            # 中途失败时别把写了一半的块留在结果目录里
+            remove_cache(dst)
+            raise
         outs.append(dst)
         cuts.append(start + length)
         fill = "，%.1f%% 满" % (100.0 * size / limit) if limit else ""
@@ -543,7 +536,6 @@ def main(argv=None):
                  size / 1048576.0, fill, replaced))
         if limit is None and size > MAX_CHUNK_BYTES:
             print("   注意：这一块超过了 %.0f MiB" % (MAX_CHUNK_BYTES / 1048576.0))
-    cleaned += 1 if remove_cache(cand_mp3) else 0
 
     # 每块的总时长（含前导静音，等于这一块在整曲时间线上的结束时间），
     # 一行一个、LF 换行，方便直接导入 Scratch 列表。
@@ -567,25 +559,24 @@ def main(argv=None):
         len(outs), total_size / 1048576.0,
         max(os.path.getsize(d) for d in outs) / 1048576.0))
 
-    # 4) 清理缓存：静音帧用完就删，temp 空了连文件夹一起删
-    print("\n4) 清理缓存")
+    # 4) 清理：删掉序号不对的旧块
+    print("\n4) 清理旧块")
     if ok:
-        cleaned += 1 if remove_cache(donor_path) else 0
         stale = clean_stale_outputs(out_dir, args.name_fmt, len(outs))
-        prune_empty_dirs(temp)
-        print("   已删除 %d 个中间文件；%s"
-              % (cleaned, "%s 已删除" % temp if not os.path.isdir(temp)
-                 else "%s 里还有其它文件，保留" % temp))
         if stale:
             print("   已删除 %d 个序号不对的旧块（这次是 1–%d）" % (stale, len(outs)))
+        else:
+            print("   没有需要清理的旧块")
     else:
-        print("   校验没通过，剩下的中间文件留在 %s，方便排查" % temp)
+        print("   校验没通过，结果文件留在 %s，方便排查" % out_dir)
 
     print("\n总体:", "通过" if ok else "有问题")
-    if ok:
-        print("块数按大小自动决定为 %d 块，记得把 .sb3 里的声音数量也改成 %d"
-              % (len(outs), len(outs)))
+    if not ok:
+        return 1
+    print("块数按大小自动决定为 %d 块，记得把 .sb3 里的声音数量也改成 %d"
+          % (len(outs), len(outs)))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
