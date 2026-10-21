@@ -435,9 +435,10 @@ def build_parser():
     p.add_argument("-o", "--output-dir", default=OUT_DIR, metavar="目录",
                    help="输出目录（默认 %(default)s）")
     p.add_argument("-s", "--seconds-per-chunk", type=int, default=SECONDS_PER_CHUNK,
-                   metavar="秒", help="按固定时长切块（不填就按 --max-size 的大小切块）")
+                   metavar="秒", help="按固定时长切块（优先于按大小切块）")
     p.add_argument("--max-size", type=size_arg, default=None, metavar="大小",
-                   help="按大小切块时每块的上限，如 8M / 8MiB / 8388608（默认 8MiB）")
+                   help="每块体积上限，如 8M / 8MiB / 8388608（默认 8MiB）；"
+                        "不填 -s 时按它填满每块")
     p.add_argument("--name-fmt", default=NAME_FMT, metavar="格式",
                    help="输出文件名格式，{0} 是序号，从 1 开始（默认 %(default)s）")
     p.add_argument("--duration-file", default=DURATION_FILE, metavar="文件",
@@ -452,10 +453,10 @@ def build_parser():
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.seconds_per_chunk is not None and args.max_size is not None:
-        parser.error("-s 和 --max-size 只能选一个")
     if args.seconds_per_chunk is not None and args.seconds_per_chunk < 1:
         parser.error("--seconds-per-chunk 至少 1 秒")
+    if args.max_size is not None and args.max_size < 64 * 1024:
+        parser.error("--max-size 至少要 64K")
     if "{0}" not in args.name_fmt or os.path.dirname(args.name_fmt) or \
             not args.name_fmt.lower().endswith(".mp3"):
         parser.error("--name-fmt 必须是带 {0} 的 .mp3 文件名（不能带路径），例如 chunk-{0}.mp3")
@@ -485,12 +486,12 @@ def main(argv=None):
     if args.seconds_per_chunk is not None:
         seconds = args.seconds_per_chunk
         limit = None
-        mode_desc = "每块 %d 秒" % seconds
+        cap = args.max_size if args.max_size is not None else MAX_CHUNK_BYTES
+        mode_desc = "每块 %d 秒（体积上限 %.2f MiB）" % (seconds, cap / 1048576.0)
     else:
         seconds = None
         limit = args.max_size if args.max_size is not None else MAX_CHUNK_BYTES
-        if limit < 64 * 1024:
-            parser.error("--max-size 至少要 64K")
+        cap = limit
         mode_desc = "按大小，每块不超过 %.2f MiB（尽量填满）" % (limit / 1048576.0)
 
     print("输入: %s" % src)
@@ -536,7 +537,6 @@ def main(argv=None):
         print("   %s: 静音 %.3f s + 音乐 %.3f s = %.3f s，%.2f MiB%s（替换 %d 帧静音）"
               % (os.path.basename(dst), start / SR, length / SR, (start + length) / SR,
                  size / 1048576.0, fill, replaced))
-        cap = limit if limit is not None else MAX_CHUNK_BYTES
         if size > cap:
             print("   注意：这一块 %.2f MiB，超过了 %.2f MiB 的上限"
                   % (size / 1048576.0, cap / 1048576.0))
@@ -551,7 +551,6 @@ def main(argv=None):
     print("\n3) 校验")
     ok = True
     total_size = 0
-    cap = limit if limit is not None else MAX_CHUNK_BYTES
     for k, d in enumerate(outs):
         size = os.path.getsize(d)
         total_size += size
