@@ -536,8 +536,10 @@ def main(argv=None):
         print("   %s: 静音 %.3f s + 音乐 %.3f s = %.3f s，%.2f MiB%s（替换 %d 帧静音）"
               % (os.path.basename(dst), start / SR, length / SR, (start + length) / SR,
                  size / 1048576.0, fill, replaced))
-        if limit is None and size > MAX_CHUNK_BYTES:
-            print("   注意：这一块超过了 %.0f MiB" % (MAX_CHUNK_BYTES / 1048576.0))
+        cap = limit if limit is not None else MAX_CHUNK_BYTES
+        if size > cap:
+            print("   注意：这一块 %.2f MiB，超过了 %.2f MiB 的上限"
+                  % (size / 1048576.0, cap / 1048576.0))
 
     # 每块的总时长（含前导静音，等于这一块在整曲时间线上的结束时间），
     # 一行一个、LF 换行，方便直接导入 Scratch 列表。
@@ -545,18 +547,22 @@ def main(argv=None):
         fh.write("\n".join("%.3f" % (end / SR) for end in cuts[1:]).encode("ascii"))
     print("   块时长列表: %s（%d 行，LF 换行）" % (duration_path, len(outs)))
 
-    # 3) 校验：解码后的采样数、静音段是否全零、音乐和源 PCM 的误差
+    # 3) 校验：解码后的采样数、静音段是否全零、音乐和源 PCM 的误差、块体积
     print("\n3) 校验")
     ok = True
     total_size = 0
+    cap = limit if limit is not None else MAX_CHUNK_BYTES
     for k, d in enumerate(outs):
-        total_size += os.path.getsize(d)
+        size = os.path.getsize(d)
+        total_size += size
         samples, want, silent, snr = check_chunk(d, cuts[k], cuts[k + 1], pcm)
-        good = samples == want and silent and snr >= 6
+        size_ok = size <= cap
+        good = samples == want and silent and snr >= 6 and size_ok
         ok = ok and good
-        print("   %s: 采样 %7d (期望 %7d)  静音段%s  SNR %5.1f dB  %s"
+        extra = "" if size_ok else "，超过 %.2f MiB" % (cap / 1048576.0)
+        print("   %s: 采样 %7d (期望 %7d)  静音段%s  SNR %5.1f dB  %s%s"
               % (os.path.basename(d), samples, want,
-                 "全零" if silent else "有噪声", snr, "OK" if good else "BAD"))
+                 "全零" if silent else "有噪声", snr, "OK" if good else "BAD", extra))
     print("   共 %d 块，合计 %.2f MiB，最大一块 %.2f MiB" % (
         len(outs), total_size / 1048576.0,
         max(os.path.getsize(d) for d in outs) / 1048576.0))
