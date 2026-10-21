@@ -49,6 +49,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 
@@ -378,22 +379,21 @@ def remove_cache(path):
     return True
 
 
-def clean_stale_outputs(out_dir, name_fmt, count):
-    """删掉输出目录里序号不在 1..count 里的旧块（比如上次更多块留下的 4..8、旧版留下的 0）。"""
-    pattern = re.escape(name_fmt).replace(r"\{0\}", r"(\d+)")
-    regex = re.compile("^" + pattern + "$")
-    removed = 0
-    for name in os.listdir(out_dir):
-        m = regex.match(name)
-        if not m:
-            continue
-        try:
-            index = int(m.group(1))
-        except ValueError:
-            continue
-        if (index < 1 or index > count) and remove_cache(os.path.join(out_dir, name)):
-            removed += 1
-    return removed
+def is_ancestor(parent, child):
+    """parent 是否就是 child，或者 child 的上级目录。"""
+    parent = os.path.normcase(os.path.abspath(parent))
+    child = os.path.normcase(os.path.abspath(child))
+    try:
+        return os.path.commonpath([parent, child]) == parent
+    except ValueError:      # Windows 上不同盘符
+        return False
+
+
+def reset_output_dir(out_dir):
+    """把输出目录整个删掉再重建，保证里面是空的。"""
+    if os.path.exists(out_dir):
+        shutil.rmtree(out_dir)
+    os.makedirs(out_dir)
 
 
 def parse_size(text):
@@ -473,7 +473,9 @@ def main(argv=None):
 
     if not os.path.isfile(src):
         sys.exit("找不到源文件: " + src)
-    os.makedirs(out_dir, exist_ok=True)
+    if is_ancestor(out_dir, root) or is_ancestor(out_dir, src):
+        sys.exit("输出目录不能是项目目录、项目上级，或包含源文件（开始前会整个删掉）: " + out_dir)
+    reset_output_dir(out_dir)
 
     if args.music_bitrate == "auto":
         music_bitrate, music_note = auto_music_bitrate(src)
@@ -492,7 +494,7 @@ def main(argv=None):
         mode_desc = "按大小，每块不超过 %.2f MiB（尽量填满）" % (limit / 1048576.0)
 
     print("输入: %s" % src)
-    print("输出: %s" % out_dir)
+    print("输出: %s（已清空重建）" % out_dir)
     print("音乐段: %s（%s）" % (music_bitrate, music_note))
     print("切块: %s，静音 %s，文件名 %s\n"
           % (mode_desc, args.silence_bitrate, args.name_fmt))
@@ -558,17 +560,6 @@ def main(argv=None):
     print("   共 %d 块，合计 %.2f MiB，最大一块 %.2f MiB" % (
         len(outs), total_size / 1048576.0,
         max(os.path.getsize(d) for d in outs) / 1048576.0))
-
-    # 4) 清理：删掉序号不对的旧块
-    print("\n4) 清理旧块")
-    if ok:
-        stale = clean_stale_outputs(out_dir, args.name_fmt, len(outs))
-        if stale:
-            print("   已删除 %d 个序号不对的旧块（这次是 1–%d）" % (stale, len(outs)))
-        else:
-            print("   没有需要清理的旧块")
-    else:
-        print("   校验没通过，结果文件留在 %s，方便排查" % out_dir)
 
     print("\n总体:", "通过" if ok else "有问题")
     if not ok:
