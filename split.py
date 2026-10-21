@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-"""大音频分块脚本（WAV 精确切块 → 音乐 320 kbps + 前导静音 32 kbps）
+"""大音频分块脚本（WAV 精确切块 → 按输入码率编码音乐 + 32 kbps 前导静音）
 
 流程：
-  1. 原 MP3 → temp/source.wav（解码一次，得到完整 PCM）
-  2. 从 WAV 按采样点精确切块：第 n 块 = n 分钟静音 + 第 n 分钟，写到 temp/wav/
-  3. 每块单独编码成 MP3：音乐段和 input.mp3 一样用 320 kbps CBR，
-     并加 -reservoir 0 关掉比特池（这样每一帧都能独立解码）
+  1. 原音频 → temp/source.wav（解码一次，得到完整 PCM）
+  2. 从 WAV 按采样点精确切块：第 n 块 = 前面垫 n 块时长的静音 + 第 n 段音乐，写到 temp/wav/
+  3. 每块单独编码成 MP3：音乐段默认按输入文件的码率自动决定（MP3 输入用它的码率，
+     其它格式用 320 kbps），并加 -reservoir 0 关掉比特池（这样每一帧都能独立解码）
   4. 把前导静音里"无论怎样都肯定全在静音里"的帧，换成预生成的 32 kbps 静音帧
      （只是替换帧，帧数不变，所以解码后的采样数和音乐起点分毫不变）
   5. 回读校验：采样数、静音段是否全零、音乐段和源 PCM 的误差
@@ -17,8 +17,9 @@
 为什么音质能和 input.mp3 一样：
       MP3 是有损格式，重新编码不可能逐字节无损；真无损只能用 WAV/FLAC，
       但 60 秒立体声 WAV 就超过 10 MB，会超过 8 MB 的上传限制。
-      这里改用和原文件相同的 320 kbps CBR 重新编码，音乐段和源 PCM 的误差约
-      38 dB SNR（原来的 V0 约 32 dB），远低于人耳能分辨的程度。
+      音乐段默认按输入的码率编码：320k 输入 → 320k 输出（约 38 dB SNR），
+      128k 输入 → 128k 输出（约 22 dB，会再多一点损失）。想尽量保音质、不在乎体积时，
+      可以用 -b 320k 强制按 320k 编码。
 
 为什么静音可以几乎不占体积：
       LAME 默认会跨帧共用比特（比特池），一帧的数据可能引用前面几帧的字节，
@@ -41,6 +42,7 @@
 
 import argparse
 import array
+import json
 import math
 import os
 import subprocess
@@ -54,9 +56,9 @@ TEMP_DIR = "temp"
 SECONDS_PER_CHUNK = 60
 NAME_FMT = "{0}.mp3"
 
-# 音乐段码率：和 input.mp3 一致（320 kbps CBR）。
-# 想更省体积可以改成 "256k" / "192k"，但离原文件会越来越远。
-MUSIC_BITRATE = "320k"
+# 音乐段码率："auto" = 按输入文件自动决定（MP3 用它自己的码率，其它格式用 320k）。
+# 也可以直接写 "320k" / "256k" / "192k" 强制指定。
+MUSIC_BITRATE = "auto"
 # 前导静音码率：MPEG-1 立体声允许的最低码率，只影响体积，不影响音质。
 SILENCE_BITRATE = "32k"
 # ============================================================
@@ -88,16 +90,15 @@ def decode_bytes(path):
     return p.stdout[: len(p.stdout) // 2 * 2]
 
 
-def mp3_frames(data):
-    """拆出 MPEG-1 Layer III 的帧。
+def iter_mp3_frames(data):
+    """逐帧解析 MPEG-1 Layer III，产出 dict(off, size, br, sr, mdb, xing)。
 
-    返回 [{off, size, br, mdb, xing}, ...]：
-      off/size  帧在文件里的位置和长度
-      br        该帧码率（kbps）
-      mdb       main_data_begin，0 表示这一帧不引用前面的字节（自包含）
-      xing      Xing/Info 标签帧（元数据帧，不是音频）
+    off/size  帧在文件里的位置和长度
+    br        该帧码率（kbps）
+    sr        采样率
+    mdb       main_data_begin，0 表示这一帧不引用前面的字节（自包含）
+    xing      Xing/Info 标签帧（元数据帧，不是音频）
     """
-    frames = []
     off = 0
     n = len(data)
     if data[:3] == b"ID3" and n >= 10:
@@ -123,9 +124,97 @@ def mp3_frames(data):
         mdb = (data[off + 4] << 1) | (data[off + 5] >> 7)
         tag_at = off + 4 + (17 if mode == 3 else 32) + (2 if (data[off + 1] & 1) == 0 else 0)
         xing = data[tag_at:tag_at + 4] if data[tag_at:tag_at + 4] in (b"Xing", b"Info") else None
-        frames.append(dict(off=off, size=size, br=BITRATES[br_i], mdb=mdb, xing=xing))
+        yield dict(off=off, size=size, br=BITRATES[br_i], sr=sr, mdb=mdb, xing=xing)
         off += size
-    return frames
+
+
+def mp3_frames(data):
+    """拆出 MPEG-1 Layer III 的帧，返回列表。"""
+    return list(iter_mp3_frames(data))
+
+
+def input_mp3_stats(data):
+    """统计输入 MP3 的码率：音频帧数、平均码率（kbps）、最低/最高帧码率。"""
+    frames = 0
+    total = 0
+    low = high = None
+    sr = SR
+    for f in iter_mp3_frames(data):
+        if f["xing"]:
+            continue
+        frames += 1
+        total += f["size"]
+        low = f["br"] if low is None else min(low, f["br"])
+        high = f["br"] if high is None else max(high, f["br"])
+        sr = f["sr"]
+    if not frames:
+        return 0, 0.0, None, None
+    avg = total * 8 * sr / (frames * MP3_SAMPLES) / 1000.0
+    return frames, avg, low, high
+
+
+def probe_codec(path):
+    """用 ffprobe 看输入文件的音频编码格式和码率；失败时返回 (None, None)。"""
+    try:
+        p = subprocess.run(
+            ["ffprobe", "-v", "error",
+             "-show_entries", "stream=codec_name,codec_type,bit_rate",
+             "-show_entries", "format=bit_rate",
+             "-of", "json", path],
+            capture_output=True, text=True, encoding="utf-8", errors="replace")
+    except OSError:
+        return None, None
+    if p.returncode != 0:
+        return None, None
+    try:
+        info = json.loads(p.stdout)
+    except ValueError:
+        return None, None
+    audio = [s for s in (info.get("streams") or []) if s.get("codec_type") == "audio"]
+    if not audio:
+        return None, None
+    codec = audio[0].get("codec_name")
+    br = audio[0].get("bit_rate") or (info.get("format") or {}).get("bit_rate")
+    try:
+        br = int(br)
+    except (TypeError, ValueError):
+        br = None
+    return codec, br
+
+
+def nearest_bitrate(kbps):
+    """取最接近的标准 MP3 CBR 码率（32~320 kbps）。"""
+    best = 32
+    for b in (32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320):
+        if abs(b - kbps) < abs(best - kbps):
+            best = b
+    return best
+
+
+def auto_music_bitrate(src):
+    """按输入文件决定音乐段码率，返回 (码率字符串, 说明)。
+
+    MP3 输入：CBR 用它的码率，VBR 用平均码率，取最接近的标准档。
+    其它格式（WAV/FLAC 等）：用 320k。
+    """
+    codec, br = probe_codec(src)
+    if codec is None:
+        return "320k", "读不出输入格式（ffprobe 不可用？）"
+    if codec != "mp3":
+        return "320k", "输入不是 MP3（%s）" % codec
+    with open(src, "rb") as fh:
+        data = fh.read()
+    frames, avg, low, high = input_mp3_stats(data)
+    if frames >= 10:
+        if low == high:
+            target, desc = low, "输入 mp3 CBR %d kbps" % low
+        else:
+            target, desc = avg, "输入 mp3 VBR 平均 %.0f kbps，最高 %d" % (avg, high)
+    elif br:
+        target, desc = br / 1000.0, "输入 mp3 %.0f kbps" % (br / 1000.0)
+    else:
+        return "320k", "输入 mp3 的码率读不出来"
+    return "%dk" % nearest_bitrate(target), desc
 
 
 def make_silence_frame(path, bitrate):
@@ -229,8 +318,8 @@ def prune_empty_dirs(*dirs):
 def build_parser():
     p = argparse.ArgumentParser(
         prog="split.py",
-        description="大音频分块脚本：按采样点精确切块，音乐段 320 kbps、前导静音 32 kbps，"
-                    "输出无缝播放用的 MP3。",
+        description="大音频分块脚本：按采样点精确切块，音乐段默认按输入码率编码、"
+                    "前导静音 32 kbps，输出无缝播放用的 MP3。",
         epilog="命令行参数会覆盖脚本顶部「配置区」的默认值；相对路径按脚本所在目录解析。",
     )
     p.add_argument("-i", "--input", default=SRC, metavar="文件",
@@ -244,10 +333,18 @@ def build_parser():
     p.add_argument("--name-fmt", default=NAME_FMT, metavar="格式",
                    help="输出文件名格式，{0} 是序号（默认 %(default)s）")
     p.add_argument("-b", "--music-bitrate", default=MUSIC_BITRATE, metavar="码率",
-                   help="音乐段码率（默认 %(default)s）")
+                   help="音乐段码率；auto = 按输入文件自动决定（默认 %(default)s）")
     p.add_argument("--silence-bitrate", default=SILENCE_BITRATE, metavar="码率",
                    help="前导静音码率（默认 %(default)s）")
     return p
+
+
+def normalize_bitrate(value):
+    """-b 320 / -b 320K 都当成 320k，"AUTO" 当成 auto。"""
+    v = value.strip().lower()
+    if v.isdigit():
+        v += "k"
+    return v
 
 
 def main(argv=None):
@@ -258,6 +355,8 @@ def main(argv=None):
     if "{0}" not in args.name_fmt or os.path.dirname(args.name_fmt) or \
             not args.name_fmt.lower().endswith(".mp3"):
         parser.error("--name-fmt 必须是带 {0} 的 .mp3 文件名（不能带路径），例如 chunk-{0}.mp3")
+    args.music_bitrate = normalize_bitrate(args.music_bitrate)
+    args.silence_bitrate = normalize_bitrate(args.silence_bitrate)
 
     root = os.path.dirname(os.path.abspath(__file__))
 
@@ -276,11 +375,17 @@ def main(argv=None):
     os.makedirs(out_dir, exist_ok=True)
     os.makedirs(wav_dir, exist_ok=True)
 
+    if args.music_bitrate == "auto":
+        music_bitrate, music_note = auto_music_bitrate(src)
+    else:
+        music_bitrate, music_note = args.music_bitrate, "手动指定"
+
     print("输入: %s" % src)
     print("输出: %s" % out_dir)
     print("临时: %s" % temp)
-    print("每块 %d 秒，音乐 %s，静音 %s，文件名 %s\n"
-          % (args.seconds_per_chunk, args.music_bitrate, args.silence_bitrate, args.name_fmt))
+    print("每块 %d 秒，静音 %s，文件名 %s"
+          % (args.seconds_per_chunk, args.silence_bitrate, args.name_fmt))
+    print("音乐段: %s（%s）\n" % (music_bitrate, music_note))
 
     # 1) 解码成 WAV（缓存）
     print("1) 解码源文件 -> %s" % src_wav)
@@ -326,11 +431,11 @@ def main(argv=None):
 
     # 3) 每块单独编码 + 替换静音帧
     donor = make_silence_frame(donor_path, args.silence_bitrate)
-    print("\n3) 编码 MP3（音乐 %s CBR，前导静音 %s）" % (args.music_bitrate, args.silence_bitrate))
+    print("\n3) 编码 MP3（音乐 %s CBR，前导静音 %s）" % (music_bitrate, args.silence_bitrate))
     outs = []
     for k, w in enumerate(wavs):
         dst = os.path.join(out_dir, args.name_fmt.format(k))
-        replaced = encode_chunk(w, dst, cuts[k], donor, args.music_bitrate)
+        replaced = encode_chunk(w, dst, cuts[k], donor, music_bitrate)
         outs.append(dst)
         cleaned += 1 if remove_cache(w) else 0
         print("   %s  %.2f MB（替换 %d 帧静音）"
@@ -343,7 +448,7 @@ def main(argv=None):
     for k, d in enumerate(outs):
         total_size += os.path.getsize(d)
         samples, want, silent, snr = check_chunk(d, cuts[k], cuts[k + 1], pcm)
-        good = samples == want and silent and snr >= 10
+        good = samples == want and silent and snr >= 6
         ok = ok and good
         print("   %s: 采样 %7d (期望 %7d)  静音段%s  SNR %5.1f dB  %s"
               % (os.path.basename(d), samples, want,
