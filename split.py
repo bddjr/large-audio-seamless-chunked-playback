@@ -59,7 +59,9 @@ import wave
 SRC = "input.mp3"
 OUT_DIR = "output-chunks"
 TEMP_DIR = "temp"
-NAME_FMT = "{0}.mp3"
+NAME_FMT = "{0}.mp3"      # {0} 是块序号，从 1 开始（和 Scratch 里默认的声音编号一致）
+# 每块时长的列表文件（给 Scratch 列表导入用），相对脚本目录。
+DURATION_FILE = "output-chunks-duration.txt"
 
 # 默认按大小切块：每块尽量填满，但不超过 MAX_CHUNK_BYTES。
 MAX_CHUNK_BYTES = 8 * 1024 * 1024
@@ -370,7 +372,7 @@ def remove_cache(path):
 
 
 def clean_stale_outputs(out_dir, name_fmt, count):
-    """删掉输出目录里序号 >= count 的旧块（上次切的块数比这次多时留下的）。"""
+    """删掉输出目录里序号不在 1..count 里的旧块（比如上次更多块留下的 4..8、旧版留下的 0）。"""
     pattern = re.escape(name_fmt).replace(r"\{0\}", r"(\d+)")
     regex = re.compile("^" + pattern + "$")
     removed = 0
@@ -382,7 +384,7 @@ def clean_stale_outputs(out_dir, name_fmt, count):
             index = int(m.group(1))
         except ValueError:
             continue
-        if index >= count and remove_cache(os.path.join(out_dir, name)):
+        if (index < 1 or index > count) and remove_cache(os.path.join(out_dir, name)):
             removed += 1
     return removed
 
@@ -442,7 +444,9 @@ def build_parser():
     p.add_argument("--max-size", type=size_arg, default=None, metavar="大小",
                    help="按大小切块时每块的上限，如 8M / 8MiB / 8388608（默认 8MiB）")
     p.add_argument("--name-fmt", default=NAME_FMT, metavar="格式",
-                   help="输出文件名格式，{0} 是序号（默认 %(default)s）")
+                   help="输出文件名格式，{0} 是序号，从 1 开始（默认 %(default)s）")
+    p.add_argument("--duration-file", default=DURATION_FILE, metavar="文件",
+                   help="每块时长列表的输出文件（默认 %(default)s）")
     p.add_argument("-b", "--music-bitrate", default=MUSIC_BITRATE, metavar="码率",
                    help="音乐段码率；auto = 按输入文件自动决定（默认 %(default)s）")
     p.add_argument("--silence-bitrate", default=SILENCE_BITRATE, metavar="码率",
@@ -471,6 +475,7 @@ def main(argv=None):
     src = resolve(args.input)
     out_dir = resolve(args.output_dir)
     temp = resolve(args.temp_dir)
+    duration_path = resolve(args.duration_file)
     src_wav = os.path.join(temp, "source.wav")
     donor_path = os.path.join(temp, "silence.mp3")
     cand_mp3 = os.path.join(temp, "chunk.mp3")
@@ -533,7 +538,7 @@ def main(argv=None):
         else:
             length, out, size, replaced = fit_chunk(
                 pcm, start, remaining, limit, music_bitrate, donor, cand_mp3)
-        dst = os.path.join(out_dir, args.name_fmt.format(len(outs)))
+        dst = os.path.join(out_dir, args.name_fmt.format(len(outs) + 1))
         with open(dst, "wb") as fh:
             fh.write(out)
         outs.append(dst)
@@ -545,6 +550,12 @@ def main(argv=None):
         if limit is None and size > MAX_CHUNK_BYTES:
             print("   注意：这一块超过了 %.0f MiB" % (MAX_CHUNK_BYTES / 1048576.0))
     cleaned += 1 if remove_cache(cand_mp3) else 0
+
+    # 每块的总时长（含前导静音，等于这一块在整曲时间线上的结束时间），
+    # 一行一个、LF 换行，方便直接导入 Scratch 列表。
+    with open(duration_path, "wb") as fh:
+        fh.write("\n".join("%.3f" % (end / SR) for end in cuts[1:]).encode("ascii"))
+    print("   块时长列表: %s（%d 行，LF 换行）" % (duration_path, len(outs)))
 
     # 3) 校验：解码后的采样数、静音段是否全零、音乐和源 PCM 的误差
     print("\n3) 校验")
@@ -572,7 +583,7 @@ def main(argv=None):
               % (cleaned, "%s 已删除" % temp if not os.path.isdir(temp)
                  else "%s 里还有其它文件，保留" % temp))
         if stale:
-            print("   已删除 %d 个序号超出的旧块（这次只切出 %d 块）" % (stale, len(outs)))
+            print("   已删除 %d 个序号不对的旧块（这次是 1–%d）" % (stale, len(outs)))
     else:
         print("   校验没通过，剩下的中间文件留在 %s，方便排查" % temp)
 
