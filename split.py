@@ -58,8 +58,8 @@ import sys
 SRC = "input.mp3"
 OUT_DIR = "output-chunks"
 NAME_FMT = "{0}.mp3"      # {0} 是块序号，从 1 开始（和 Scratch 里默认的声音编号一致）
-# 每块时长的列表文件（给 Scratch 列表导入用），相对脚本目录。
-DURATION_FILE = "output-chunks-duration.txt"
+# 每块时长的 JSON 数组（给 Scratch 列表导入用），相对脚本目录。
+DURATION_FILE = "output-chunks-duration.json"
 
 # 默认按大小切块：从后往前把每块填满，但不超过 MAX_CHUNK_BYTES。
 MAX_CHUNK_BYTES = 8 * 1024 * 1024
@@ -447,7 +447,7 @@ def build_parser():
     p.add_argument("--name-fmt", default=NAME_FMT, metavar="格式",
                    help="输出文件名格式，{0} 是序号，从 1 开始（默认 %(default)s）")
     p.add_argument("--duration-file", default=DURATION_FILE, metavar="文件",
-                   help="每块时长列表的输出文件（默认 %(default)s）")
+                   help="每块时长 JSON 的输出文件（默认 %(default)s）")
     p.add_argument("-b", "--music-bitrate", default=MUSIC_BITRATE, metavar="码率",
                    help="音乐段码率；auto = 按输入文件自动决定（默认 %(default)s）")
     p.add_argument("--silence-bitrate", default=SILENCE_BITRATE, metavar="码率",
@@ -574,10 +574,11 @@ def main(argv=None):
                   % (size / 1048576.0, cap / 1048576.0))
 
     # 每块的总时长（含前导静音，等于这一块在整曲时间线上的结束时间），
-    # 一行一个、LF 换行，方便直接导入 Scratch 列表。
+    # 输出成 JSON 浮点数组，方便导入 Scratch 列表。
+    values = [round(end / SR, 3) for end in cuts[1:]]
     with open(duration_path, "wb") as fh:
-        fh.write("\n".join("%.3f" % (end / SR) for end in cuts[1:]).encode("ascii"))
-    print("   块时长列表: %s（%d 行，LF 换行）" % (duration_path, len(outs)))
+        fh.write(json.dumps(values, separators=(",", ":")).encode("ascii"))
+    print("   块时长列表: %s（%d 个浮点数，JSON）" % (duration_path, len(outs)))
 
     # 3) 校验：解码后的采样数、静音段是否全零、音乐和源 PCM 的误差、块体积
     print("\n3) 校验")

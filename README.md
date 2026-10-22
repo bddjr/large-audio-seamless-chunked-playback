@@ -1,6 +1,6 @@
 # 大音频分块无缝播放
 
-稽木世界（gitblock.cn）限制单个资源不能超过 8 MiB，超过这个大小的音频不能整个上传。（参考 https://github.com/a49594a/scratch-gui/blob/c2c14c6895901bc04c8c1ab197f328099cf5ae8e/src/lib/project-saver-hoc.jsx#L226 ）
+稽木世界（gitblock.cn）限制单个资源不能超过 8 MiB，超过这个大小的音频不能整个上传。[[参考源代码]](https://github.com/a49594a/scratch-gui/blob/c2c14c6895901bc04c8c1ab197f328099cf5ae8e/src/lib/project-saver-hoc.jsx#L226)
 
 以往多数音频分块播放的作品，在不同音频块衔接时会卡一下，也就是有一小段时间完全没有声音。
 
@@ -14,10 +14,11 @@
 .
 ├─ input.mp3                  # 待处理的整曲（脚本只认这个文件名）
 ├─ split.py                   # 切块 + 编码
-├─ duration.py                # 读音频时长（秒）
+├─ inject_sb3.py              # 把分块和时长灌进 .sb3
+├─ duration.py                # 读音频时长（秒，可选）
 ├─ output-chunks/             # 切块结果：1.mp3、2.mp3、…
 │  └─ 1.mp3 …（数量按大小自动决定，这首 3 块）
-├─ output-chunks-duration.txt # 每块时长（给 Scratch 列表导入用）
+├─ output-chunks-duration.json # 每块时长（JSON 浮点数组）
 ├─ COPYING                    # 许可证（代码是 Unlicense；input.mp3 版权不属于本项目）
 ├─ 大音频分块无缝播放.sb3
 └─ README.md
@@ -41,12 +42,14 @@ python --version
 在项目目录下：
 
 ```powershell
-# 1) 看整曲多长（秒），填到 .sb3 里
-python duration.py
-
-# 2) 切块并编码，输出到 output-chunks/
+# 1) 切块并编码，输出到 output-chunks/
 python split.py
+
+# 2) 把分块、时长列表和总时长灌进 .sb3
+python inject_sb3.py
 ```
+
+`duration.py` 只用来单独查看时长；正常流程里 `.sb3` 的总时长和舞台变量由 `inject_sb3.py` 一起更新，不用手动跑。
 
 `split.py` 跑完会打印每一块的时间范围、体积和填充率，以及校验结果，最后一行是 `总体: 通过` 或 `总体: 有问题`（有问题时退出码为 1）。每次开始前会把输出目录整个删掉重建；试编码时会临时用输出目录里的 `_trial.mp3`，跑完就删。
 
@@ -75,7 +78,7 @@ python split.py --help                                 # 查看全部参数
 | `--name-fmt` | `NAME_FMT` | `{0}.mp3` | 输出文件名格式，`{0}` 是序号，从 1 开始 |
 | `-b, --music-bitrate` | `MUSIC_BITRATE` | `auto` | 音乐段码率；`auto` = 按输入文件自动决定（MP3 用它自己的码率，其它格式用 320k）。也可以写 `320k` / `192k` 强制指定 |
 | `--silence-bitrate` | `SILENCE_BITRATE` | `32k` | 前导静音码率，MPEG-1 立体声的最低值，只影响体积，不影响音质 |
-| `--duration-file` | `DURATION_FILE` | `output-chunks-duration.txt` | 每块时长列表的输出文件，一行一个、LF 换行 |
+| `--duration-file` | `DURATION_FILE` | `output-chunks-duration.json` | 每块时长的 JSON 数组文件 |
 
 采样率固定 44.1 kHz、双声道、16 bit。
 
@@ -83,22 +86,20 @@ python split.py --help                                 # 查看全部参数
 
 1. **清空输出目录**：开始前把输出目录整个删掉再重建（子目录也会没），保证里面是空的，避免上次的块或半成品混进来。
 2. **解码一次**：`input.mp3` 通过 ffmpeg 管道直接读成内存里的 PCM（不落 WAV），后面全部基于这份 PCM，不再碰原音频。
-3. **从后往前逐块填满**：默认先试编码最后一块，找到「不超过 `MAX_CHUNK_BYTES`」的最长音乐，再以它的起点为终点填上一块，一直往前推到第一块。这样前面的块尽量短，静音总量和总体积最小；第一块是剩下的，可能偏小。试编码临时写在输出目录的 `_trial.mp3`，规划完删除。边界确定后把每块的总时长写到 `output-chunks-duration.txt`（一行一个，LF 换行）。
+3. **从后往前逐块填满**：默认先试编码最后一块，找到「不超过 `MAX_CHUNK_BYTES`」的最长音乐，再以它的起点为终点填上一块，一直往前推到第一块。这样前面的块尽量短，静音总量和总体积最小；第一块是剩下的，可能偏小。试编码临时写在输出目录的 `_trial.mp3`，规划完删除。边界确定后把每块的总时长写到 `output-chunks-duration.json`（JSON 浮点数组）。
 4. **逐块独立编码**：每块单独用 LAME CBR 编码成 `output-chunks/n.mp3`（n 从 1 开始），码率按 `MUSIC_BITRATE`（默认 `auto`：MP3 输入用输入码率，其它格式用 320k）；编码时加 `-reservoir 0` 关掉比特池，让每一帧都能独立解码；同时保留 LAME 写的 Xing/Info 标签，解码器据此裁掉编码器延迟，所以每块解码出来就是精确的 PCM 长度。
 5. **把长静音换成低码率帧**：编码完成后，把前导静音里「整帧都落在静音区」的那些帧，替换成预先生成好的 32 kbps 静音帧（帧数不变，前后各留了余量）。静音部分固定只按 32 kbps 算，解码结果分毫不变。
 6. **回读校验**：把每块解码回 PCM，检查采样数是否精确等于期望值、静音段是否全零、音乐段和源 PCM 的误差（SNR）、体积是否不超过上限；任何一项不通过都会判 BAD，最后输出「总体: 有问题」并返回退出码 1。整个流程不生成 temp 目录：PCM 和静音帧都在内存里，只有试编码会临时用输出目录里的 `_trial.mp3`，跑完删除。
 
-### output-chunks-duration.txt
+### output-chunks-duration.json
 
-每块的总时长，一行一个（秒，保留三位小数），包含前导静音——也就是这一块在整曲时间线上的结束时间。当前这首是：
+每块的总时长，一个 JSON 浮点数组（秒，三位小数），包含前导静音——也就是这一块在整曲时间线上的结束时间。当前这首是：
 
-```text
-92.209
-292.626
-473.125
+```json
+[92.209,292.626,473.125]
 ```
 
-换行符固定 LF，最后一行后面没有多余空行，可以直接在 Scratch 里导入成列表（第 1 项对应 `1.mp3`，第 2 项对应 `2.mp3`……）。用 `--duration-file` 可以改输出位置。
+第 1 项对应 `1.mp3`，第 2 项对应 `2.mp3`……`inject_sb3.py` 会把它写进 `.sb3` 的列表；用 `--duration-file` 可以改输出位置。
 
 ### 音质和码率是怎么自动决定的
 
@@ -133,13 +134,32 @@ MP3 每帧的频谱数据依赖前面几帧（比特池）。直接按字节切�
 
 每块前面都垫了「前面所有块的总时长」的静音，因此可以把所有块**同时**开始播放：第 *n* 块要等前面几块播完才出声，任意时刻只有一块真正在响。这样就不依赖 Scratch 的定时器和「等待」精度，块与块之间也不会出现空隙。
 
-按大小切块后块数不固定（这首 320k 是 3 块，128k 整首甚至只有 1 块），`.sb3` 里要放对应数量的声音和播放逻辑。换歌后重跑 `split.py`，看输出里的「共 N 块」，把 `.sb3` 的声音数量改成 N（文件名就是 `1.mp3` … `N.mp3`，和 Scratch 默认的声音编号一致），再用 `duration.py` 读出新的总时长填回 `计时器 < …` 判断；`.sb3` 里嵌的还是旧音频，需要把 `output-chunks/` 里的新文件重新导入。每块的时长在 `output-chunks-duration.txt` 里，可以直接在 Scratch 里导入成列表。
+按大小切块后块数不固定（这首 320k 是 3 块，128k 整首甚至只有 1 块），`.sb3` 里要放对应数量的声音和播放逻辑。换歌后重跑 `split.py`，再跑 `inject_sb3.py`：声音 `1..N`、列表 `output-chunks-duration` 和变量 `音频时长` 会一起更新，声音数量变了也会自动增删。播放逻辑遍历的应该是 `1..N` 这些声音名字（列表里存的是时长，不是声音名）；`.sb3` 里的 `播放` 积木要按这个逻辑改。
+
+## inject_sb3.py
+
+把 `output-chunks/` 里的分块和时长灌进 `.sb3`：
+
+```powershell
+python inject_sb3.py                 # 覆盖 大音频分块无缝播放.sb3
+python inject_sb3.py -o 新.sb3       # 写到新文件
+```
+
+它只改数据，不动积木：
+
+- 声音 `1`..`N` 替换成 `output-chunks/1..N.mp3`，同步 `assetId`、`md5ext`、`sampleCount`；
+- 列表 `output-chunks-duration` 换成新的每块结束时间（存浮点数）；
+- 变量 `音频时长` 换成总时长；
+- 舞台变量 `播放进度` = `00:00.000`，`播放第几块音频` = 1，`距离播完这块音频还剩` = 第 1 块时长（格式 `00:00.000`）；
+- 角色临时变量 `tmp`、`计时器转显示格式输出`、`计算距离播完这块音频还剩`、`计时器` 的值清空。
+
+声音数量比 N 多会删掉多余的、少会补上；其它声音、造型和积木不动。
 
 ## duration.py
 
 ### 用途
 
-看 `input.mp3` 有多长（秒），把输出的数字填到 `.sb3` 里——作品里用 `计时器 < 时长` 判断什么时候播完。
+单独查看 `input.mp3` 有多长（秒）。正常流程里 `.sb3` 的 `音频时长` 和舞台变量由 `inject_sb3.py` 更新，一般不用手动跑。
 
 ### 调用
 
