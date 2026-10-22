@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
-"""大音频分块脚本（按大小填满每块 → 音乐按输入码率编码 + 32 kbps 前导静音）
+"""大音频分块脚本（按大小从后往前填满每块 → 音乐按输入码率编码 + 32 kbps 前导静音）
 
 流程：
   1. 原音频 → 内存里的 PCM（ffmpeg 管道解码一次，不落 WAV）
-  2. 默认按大小切块：一边试编码一边找边界，让每块「前导静音 + 音乐」编码后
-     不超过 MAX_CHUNK_BYTES（默认 8 MiB），并且尽量把这一块填满。
+  2. 默认按大小切块：从最后一块往前逐块试编码，让每块「前导静音 + 音乐」编码后
+     不超过 MAX_CHUNK_BYTES（默认 8 MiB）；最后几块填到尽量满，第一块是剩下的。
      想按固定时长切就用 -s 60（旧行为）。
   3. 每块单独编码成 MP3：音乐段默认按输入文件的码率自动决定（MP3 输入用它的码率，
      其它格式用 320 kbps），并加 -reservoir 0 关掉比特池（这样每一帧都能独立解码）
@@ -14,7 +14,8 @@
 
 注意：按大小切块后块数会变（不再固定 8 块），.sb3 里的声音数量要一起改。
 
-过程不写临时文件：PCM 和静音帧都在内存里，MP3 直接编码到 output-chunks/。
+过程不生成 temp 目录：PCM 和静音帧都在内存里，只有试编码会临时用
+output-chunks/_trial.mp3，跑完删除。
 
 为什么音质能和 input.mp3 一样：
       MP3 是有损格式，重新编码不可能逐字节无损；真无损只能用 WAV/FLAC，
@@ -60,7 +61,7 @@ NAME_FMT = "{0}.mp3"      # {0} 是块序号，从 1 开始（和 Scratch 里默
 # 每块时长的列表文件（给 Scratch 列表导入用），相对脚本目录。
 DURATION_FILE = "output-chunks-duration.txt"
 
-# 默认按大小切块：每块尽量填满，但不超过 MAX_CHUNK_BYTES。
+# 默认按大小切块：从后往前把每块填满，但不超过 MAX_CHUNK_BYTES。
 MAX_CHUNK_BYTES = 8 * 1024 * 1024
 # 想按固定时长切块（旧行为）就把这里设成秒数（例如 60），或者用 -s 60。
 SECONDS_PER_CHUNK = None
@@ -294,49 +295,53 @@ def make_spliced(data, lead, donor):
     return tag + donor * replaced + body, replaced
 
 
-def fit_chunk(pcm, start, remaining, limit, bitrate, donor, dst):
-    """在不超过 limit 字节的前提下，找最长的音乐长度，直接写到 dst。
+def fit_end(pcm, end, cap, bitrate, donor, scratch):
+    """找结束于 end 的块：start 尽量小（块尽量长），但拼接后的体积不超过 cap。
 
-    返回 (length, 最终字节数, 替换帧数)。试编码也直接写 dst，最后把拼好的结果写回。
+    返回 (start, 拼接好的字节, 替换帧数)。如果 [0, end] 整个放得下，
+    返回 start=0，这一块就是第一块。试编码写到 scratch，由调用方删除。
     """
     kbps = int(bitrate.rstrip("k"))
-    bytes_per_sec = kbps * 1000.0 / 8
-    frame_bytes = 144000.0 * kbps / SR       # 每帧平均字节数
-    frame_max = int(frame_bytes) + 1         # 每帧最多字节数
-    silence_bytes = max(0, start // MP3_SAMPLES - 1) * len(donor)
+    frame_bytes = 144000.0 * kbps / SR           # 每帧音乐字节
+    music_rate = kbps * 1000.0 / 8 / SR          # 音乐每采样字节
+    silence_rate = len(donor) / float(MP3_SAMPLES)  # 静音每采样字节
+    slope = music_rate - silence_rate            # 起点每后移 1 采样，体积减少这么多
+    if slope <= 0:
+        raise RuntimeError("码率太低，没法按大小切块")
+    overhead = 3.0 * frame_bytes - len(donor)     # 标签帧 + 2 个保留静音帧
+    if silence_rate * end >= cap - overhead:
+        raise RuntimeError("曲目太长：靠后的块光是前导静音就会超过 %.1f MiB"
+                           % (cap / 1048576.0))
 
-    # 初始估计：留 4 KB 给标签帧和音乐开头保留的静音帧
-    length = int((limit - silence_bytes - 4096) / bytes_per_sec * SR)
-    length = max(0, min(length, remaining))
-    if length < MP3_SAMPLES:
-        raise RuntimeError("第 %.1f 秒处放不下一块：光是前导静音就快占满 %.1f MiB 了，曲目太长"
-                           % (start / SR, limit / 1048576.0))
-
+    # 先按公式估一个起点，再按实测体积微调
+    t = int((music_rate * end - (cap - overhead)) / slope)
+    t = max(0, min(t, end - 1))
     best = None
-    for _ in range(6):
-        encode_pcm(padded_pcm(pcm, start, length), dst, bitrate)
-        out, replaced = make_spliced(open(dst, "rb").read(), start, donor)
+    for _ in range(8):
+        length = end - t
+        if length < 1:
+            break
+        encode_pcm(padded_pcm(pcm, t, length), scratch, bitrate)
+        out, replaced = make_spliced(open(scratch, "rb").read(), t, donor)
         size = len(out)
-        if size <= limit:
+        if size <= cap:
             if best is None or size > best[2]:
-                best = (length, out, size, replaced)
-            room = limit - size
-            extra = int(room // frame_max)
-            if extra <= 0 or length >= remaining:
+                best = (t, out, replaced, size)
+            if t == 0:
                 break
-            length = min(length + extra * MP3_SAMPLES, remaining)
+            step = int((cap - size) / slope)
+            if step <= 0:
+                break
+            t = max(0, t - step)
         else:
             if best is not None:
                 break
-            length -= (int((size - limit) // frame_bytes) + 2) * MP3_SAMPLES
-            if length < MP3_SAMPLES:
-                break
+            step = int((size - cap) / slope) + 2
+            t = min(end - 1, t + step)
     if best is None:
-        raise RuntimeError("第 %.1f 秒处放不下一块：%.1f MiB 的限额不够用，曲目太长或码率太高"
-                           % (start / SR, limit / 1048576.0))
-    with open(dst, "wb") as fh:
-        fh.write(best[1])
-    return best[0], best[2], best[3]
+        raise RuntimeError("放不下：结束于 %.3f 秒的块连静音都超过 %.1f MiB"
+                           % (end / SR, cap / 1048576.0))
+    return best[0], best[1], best[2]
 
 
 def check_chunk(path, lead, music_end, pcm):
@@ -438,7 +443,7 @@ def build_parser():
                    metavar="秒", help="按固定时长切块（优先于按大小切块）")
     p.add_argument("--max-size", type=size_arg, default=None, metavar="大小",
                    help="每块体积上限，如 8M / 8MiB / 8388608（默认 8MiB）；"
-                        "不填 -s 时按它填满每块")
+                        "不填 -s 时按它从后往前填满每块")
     p.add_argument("--name-fmt", default=NAME_FMT, metavar="格式",
                    help="输出文件名格式，{0} 是序号，从 1 开始（默认 %(default)s）")
     p.add_argument("--duration-file", default=DURATION_FILE, metavar="文件",
@@ -492,7 +497,7 @@ def main(argv=None):
         seconds = None
         limit = args.max_size if args.max_size is not None else MAX_CHUNK_BYTES
         cap = limit
-        mode_desc = "按大小，每块不超过 %.2f MiB（尽量填满）" % (limit / 1048576.0)
+        mode_desc = "按大小，每块不超过 %.2f MiB（从后往前填满）" % (limit / 1048576.0)
 
     print("输入: %s" % src)
     print("输出: %s（已清空重建）" % out_dir)
@@ -507,34 +512,59 @@ def main(argv=None):
     total = len(pcm) // CH
     print("   %d 采样，%.3f 秒\n" % (total, total / SR))
 
-    # 2) 逐块找边界 + 编码 + 替换静音帧
+    # 2) 编码 MP3：按大小切块时从后往前逐块填满，第一块是剩下的
     donor = make_silence_frame(args.silence_bitrate)
     print("2) 编码 MP3（音乐 %s CBR，前导静音 %s）" % (music_bitrate, args.silence_bitrate))
-    outs = []
-    sizes = []
-    cuts = [0]
-    while cuts[-1] < total:
-        start = cuts[-1]
-        remaining = total - start
-        dst = os.path.join(out_dir, args.name_fmt.format(len(outs) + 1))
-        try:
-            if seconds is not None:
-                length = min(seconds * SR, remaining)
+    encoded = []          # (start, length, 拼接字节, 替换帧数, 目标路径)
+    if seconds is not None:
+        step = seconds * SR
+        cuts = list(range(0, total, step)) + [total]
+        for k in range(len(cuts) - 1):
+            start = cuts[k]
+            length = cuts[k + 1] - start
+            dst = os.path.join(out_dir, args.name_fmt.format(k + 1))
+            try:
                 encode_pcm(padded_pcm(pcm, start, length), dst, music_bitrate)
                 out, replaced = make_spliced(open(dst, "rb").read(), start, donor)
                 with open(dst, "wb") as fh:
                     fh.write(out)
-                size = len(out)
-            else:
-                length, size, replaced = fit_chunk(
-                    pcm, start, remaining, limit, music_bitrate, donor, dst)
-        except Exception:
-            # 中途失败时别把写了一半的块留在结果目录里
-            remove_cache(dst)
-            raise
+            except Exception:
+                remove_cache(dst)
+                raise
+            encoded.append((start, length, out, replaced, dst))
+    else:
+        scratch = os.path.join(out_dir, "_trial.mp3")
+        found = []        # 从后往前：(start, 拼接字节, 替换帧数)
+        end = total
+        try:
+            while True:
+                start, out, replaced = fit_end(
+                    pcm, end, cap, music_bitrate, donor, scratch)
+                found.append((start, out, replaced))
+                if start == 0:
+                    break
+                end = start
+        finally:
+            remove_cache(scratch)
+        found.reverse()
+        cuts = [f[0] for f in found] + [total]
+        for k, (start, out, replaced) in enumerate(found):
+            dst = os.path.join(out_dir, args.name_fmt.format(k + 1))
+            try:
+                with open(dst, "wb") as fh:
+                    fh.write(out)
+            except Exception:
+                remove_cache(dst)
+                raise
+            encoded.append((start, cuts[k + 1] - start, out, replaced, dst))
+        print("   从后往前填满，共 %d 块" % len(found))
+
+    outs = []
+    sizes = []
+    for k, (start, length, out, replaced, dst) in enumerate(encoded):
+        size = len(out)
         outs.append(dst)
         sizes.append(size)
-        cuts.append(start + length)
         fill = "，%.1f%% 满" % (100.0 * size / limit) if limit else ""
         print("   %s: 静音 %.3f s + 音乐 %.3f s = %.3f s，%.2f MiB%s（替换 %d 帧静音）"
               % (os.path.basename(dst), start / SR, length / SR, (start + length) / SR,
