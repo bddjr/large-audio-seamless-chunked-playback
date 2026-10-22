@@ -14,8 +14,8 @@
 
 注意：按大小切块后块数会变（不再固定 8 块），.sb3 里的声音数量要一起改。
 
-过程不生成 temp 目录：PCM 和静音帧都在内存里；反着填时每块先写成
-「- + 文件名格式」（默认 output-chunks/-1.mp3…），算完块数再改名成正式块。
+过程不生成 temp 目录：PCM 和静音帧都在内存里；反着填时先写工作文件，
+算完块数再改名成正式块。
 
 为什么音质能和 input.mp3 一样：
       MP3 是有损格式，重新编码不可能逐字节无损；真无损只能用 WAV/FLAC，
@@ -538,8 +538,9 @@ def main(argv=None):
         found = []        # 从后往前：(start, 体积, 替换帧数, 工作文件)
         end = total
         j = 1
+        temp_mp3_name_prefix = "-" if "-{0}.mp3" != args.name_fmt.strip().lower() else "_"
         while True:
-            src = os.path.join(out_dir, "-" + args.name_fmt.format(j))
+            src = os.path.join(out_dir, temp_mp3_name_prefix + str(j) + ".mp3")
             start, size, replaced = fit_end(
                 pcm, end, cap, music_bitrate, donor, src)
             found.append((start, size, replaced, src))
