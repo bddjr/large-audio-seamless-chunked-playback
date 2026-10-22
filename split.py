@@ -270,7 +270,8 @@ def encode_pcm(data, dst, bitrate):
          "-f", "s16le", "-ar", str(SR), "-ac", str(CH), "-i", "pipe:0",
          "-map", "0:a:0", "-c:a", "libmp3lame", "-b:a", bitrate,
          "-reservoir", "0", "-ar", str(SR), "-ac", str(CH),
-         "-map_metadata", "-1", "-id3v2_version", "0", "-write_id3v1", "0", dst],
+         "-map_metadata", "-1", "-id3v2_version", "0", "-write_id3v1", "0",
+         "-f", "mp3", dst],
         input=data, capture_output=True)
     if p.returncode != 0:
         raise RuntimeError("编码失败: %s\n%s" % (dst, p.stderr.decode("utf-8", "replace")))
@@ -537,10 +538,9 @@ def main(argv=None):
     else:
         found = []        # 从后往前：(start, 体积, 替换帧数, 工作文件)
         end = total
-        j = 1
-        temp_mp3_name_prefix = "-" if "-{0}.mp3" != args.name_fmt.strip().lower() else "_"
+        j = 0
         while True:
-            src = os.path.join(out_dir, temp_mp3_name_prefix + str(j) + ".mp3")
+            src = os.path.join(out_dir, str(j))
             start, size, replaced = fit_end(
                 pcm, end, cap, music_bitrate, donor, src)
             found.append((start, size, replaced, src))
