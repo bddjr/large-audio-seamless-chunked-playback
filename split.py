@@ -14,8 +14,8 @@
 
 注意：按大小切块后块数会变（不再固定 8 块），.sb3 里的声音数量要一起改。
 
-过程不生成 temp 目录：PCM 和静音帧都在内存里，只有试编码会临时用
-output-chunks/_trial.mp3，跑完删除。
+过程不生成 temp 目录：PCM 和静音帧都在内存里；反着填时每块先写成
+「- + 文件名格式」（默认 output-chunks/-1.mp3…），算完块数再改名成正式块。
 
 为什么音质能和 input.mp3 一样：
       MP3 是有损格式，重新编码不可能逐字节无损；真无损只能用 WAV/FLAC，
@@ -295,11 +295,11 @@ def make_spliced(data, lead, donor):
     return tag + donor * replaced + body, replaced
 
 
-def fit_end(pcm, end, cap, bitrate, donor, scratch):
+def fit_end(pcm, end, cap, bitrate, donor, dst):
     """找结束于 end 的块：start 尽量小（块尽量长），但拼接后的体积不超过 cap。
 
-    返回 (start, 拼接好的字节, 替换帧数)。如果 [0, end] 整个放得下，
-    返回 start=0，这一块就是第一块。试编码写到 scratch，由调用方删除。
+    返回 (start, 体积, 替换帧数)。如果 [0, end] 整个放得下，返回 start=0，
+    这一块就是第一块。试编码写到 dst，最后把最好的结果写回 dst。
     """
     kbps = int(bitrate.rstrip("k"))
     frame_bytes = 144000.0 * kbps / SR           # 每帧音乐字节
@@ -321,8 +321,8 @@ def fit_end(pcm, end, cap, bitrate, donor, scratch):
         length = end - t
         if length < 1:
             break
-        encode_pcm(padded_pcm(pcm, t, length), scratch, bitrate)
-        out, replaced = make_spliced(open(scratch, "rb").read(), t, donor)
+        encode_pcm(padded_pcm(pcm, t, length), dst, bitrate)
+        out, replaced = make_spliced(open(dst, "rb").read(), t, donor)
         size = len(out)
         if size <= cap:
             if best is None or size > best[2]:
@@ -341,7 +341,9 @@ def fit_end(pcm, end, cap, bitrate, donor, scratch):
     if best is None:
         raise RuntimeError("放不下：结束于 %.3f 秒的块连静音都超过 %.1f MiB"
                            % (end / SR, cap / 1048576.0))
-    return best[0], best[1], best[2]
+    with open(dst, "wb") as fh:
+        fh.write(best[1])
+    return best[0], best[3], best[2]
 
 
 def check_chunk(path, lead, music_end, pcm):
@@ -515,7 +517,7 @@ def main(argv=None):
     # 2) 编码 MP3：按大小切块时从后往前逐块填满，第一块是剩下的
     donor = make_silence_frame(args.silence_bitrate)
     print("2) 编码 MP3（音乐 %s CBR，前导静音 %s）" % (music_bitrate, args.silence_bitrate))
-    encoded = []          # (start, length, 拼接字节, 替换帧数, 目标路径)
+    encoded = []          # (start, length, 体积, 替换帧数, 目标路径)
     if seconds is not None:
         step = seconds * SR
         cuts = list(range(0, total, step)) + [total]
@@ -531,38 +533,31 @@ def main(argv=None):
             except Exception:
                 remove_cache(dst)
                 raise
-            encoded.append((start, length, out, replaced, dst))
+            encoded.append((start, length, len(out), replaced, dst))
     else:
-        scratch = os.path.join(out_dir, "_trial.mp3")
-        found = []        # 从后往前：(start, 拼接字节, 替换帧数)
+        found = []        # 从后往前：(start, 体积, 替换帧数, 工作文件)
         end = total
-        try:
-            while True:
-                start, out, replaced = fit_end(
-                    pcm, end, cap, music_bitrate, donor, scratch)
-                found.append((start, out, replaced))
-                if start == 0:
-                    break
-                end = start
-        finally:
-            remove_cache(scratch)
+        j = 1
+        while True:
+            src = os.path.join(out_dir, "-" + args.name_fmt.format(j))
+            start, size, replaced = fit_end(
+                pcm, end, cap, music_bitrate, donor, src)
+            found.append((start, size, replaced, src))
+            if start == 0:
+                break
+            end = start
+            j += 1
         found.reverse()
         cuts = [f[0] for f in found] + [total]
-        for k, (start, out, replaced) in enumerate(found):
+        for k, (start, size, replaced, src) in enumerate(found):
             dst = os.path.join(out_dir, args.name_fmt.format(k + 1))
-            try:
-                with open(dst, "wb") as fh:
-                    fh.write(out)
-            except Exception:
-                remove_cache(dst)
-                raise
-            encoded.append((start, cuts[k + 1] - start, out, replaced, dst))
+            os.replace(src, dst)
+            encoded.append((start, cuts[k + 1] - start, size, replaced, dst))
         print("   从后往前填满，共 %d 块" % len(found))
 
     outs = []
     sizes = []
-    for k, (start, length, out, replaced, dst) in enumerate(encoded):
-        size = len(out)
+    for k, (start, length, size, replaced, dst) in enumerate(encoded):
         outs.append(dst)
         sizes.append(size)
         fill = "，%.1f%% 满" % (100.0 * size / limit) if limit else ""
