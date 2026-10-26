@@ -7,9 +7,10 @@
      不超过 MAX_CHUNK_BYTES（默认 8 MiB）；最后几块填到尽量满，第一块是剩下的。
      想按固定时长切就用 -s 60（旧行为）。
   3. 每块单独编码成 MP3：音乐段默认按输入文件的码率自动决定（MP3 输入用它的码率，
-     其它格式用 320 kbps），并加 -reservoir 0 关掉比特池（这样每一帧都能独立解码）
+     其它格式用 320 kbps）；比特池保持开启（-reservoir 1，LAME 默认），码率分配更从容
   4. 把前导静音里"无论怎样都肯定全在静音里"的帧，换成预生成的 32 kbps 静音帧
-     （只是替换帧，帧数不变，所以解码后的采样数和音乐起点分毫不变）
+     （只是替换帧，帧数不变，所以解码后的采样数和音乐起点分毫不变）。分界点取在
+     第一个 main_data_begin==0 的帧上，并逐帧校验保留区的比特池引用都落在保留区内
   5. 回读校验：采样数、静音段是否全零、音乐段和源 PCM 的误差
 
 注意：按大小切块后块数会变（不再固定 8 块），.sb3 里的声音数量要一起改。
@@ -20,20 +21,22 @@
 为什么音质能和 input.mp3 一样：
       MP3 是有损格式，重新编码不可能逐字节无损；真无损只能用 WAV/FLAC，
       但 60 秒立体声 WAV 就超过 10 MiB，会超过 8 MiB 的上传限制。
-      音乐段默认按输入的码率编码：320k 输入 → 320k 输出（约 38 dB SNR），
+      音乐段默认按输入的码率编码：320k 输入 → 320k 输出（约 39–41 dB SNR），
       128k 输入 → 128k 输出（约 22 dB，会再多一点损失）。想尽量保音质、不在乎体积时，
       可以用 -b 320k 强制按 320k 编码。
 
 为什么静音可以几乎不占体积：
-      LAME 默认会跨帧共用比特（比特池），一帧的数据可能引用前面几帧的字节，
-      这种流没法从中间替换帧。用 -reservoir 0 编码后每帧自包含，
-      就能把前面几分钟静音的帧整段换成 32 kbps 的静音帧：
-      帧数不变 → 解码出来的采样数、音乐起点都不变，静音部分固定只按 32 kbps 算
-      （每分钟约 0.23 MiB）。
+      静音区全是数字静音，编码出来的帧本来就不借前文（main_data_begin == 0），
+      所以可以在音乐开始之前找一个不借前文的帧当分界，把它之前的帧整段换成
+      32 kbps 的静音帧：帧数不变 → 解码出来的采样数、音乐起点都不变，
+      静音部分固定只按 32 kbps 算（每分钟约 0.23 MiB）。
+      分界点之后保留的帧是原样字节，只要每一帧借的字节都还落在保留区内部，
+      音乐段就逐位不变；make_spliced() 会逐帧校验这一点。
 
 为什么这样能无缝：
-      每块都是从 PCM 独立编码出的新文件，第一帧不依赖任何前文；编码器把延迟/
-      填充写进了 LAME 标签，解码器会自动裁掉，所以每块解码出来就是精确的 PCM。
+      每块都是从 PCM 独立编码出的新文件，解码器从它的第一帧开始解（第一帧的
+      main_data_begin 一定是 0），文件内部怎么借字节都不影响别的块；编码器把
+      延迟/填充写进了 LAME 标签，解码器会自动裁掉，所以每块解码出来就是精确的 PCM。
       替换静音帧只发生在音乐开始之前（后面还留了至少 2 帧原编码的静音），
       解码器在那里的状态本来就是全零，因此音乐部分逐采样不变。
 
@@ -264,12 +267,12 @@ def padded_pcm(pcm, start, length):
 
 
 def encode_pcm(data, dst, bitrate):
-    """把 s16le PCM 从管道喂给 ffmpeg，编码成 CBR MP3（关掉比特池）。"""
+    """把 s16le PCM 从管道喂给 ffmpeg，编码成 CBR MP3（保留比特池）。"""
     p = subprocess.run(
         ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
          "-f", "s16le", "-ar", str(SR), "-ac", str(CH), "-i", "pipe:0",
          "-map", "0:a:0", "-c:a", "libmp3lame", "-b:a", bitrate,
-         "-reservoir", "0", "-ar", str(SR), "-ac", str(CH),
+         "-reservoir", "1", "-ar", str(SR), "-ac", str(CH),
          "-map_metadata", "-1", "-id3v2_version", "0", "-write_id3v1", "0",
          "-f", "mp3", dst],
         input=data, capture_output=True)
@@ -277,23 +280,56 @@ def encode_pcm(data, dst, bitrate):
         raise RuntimeError("编码失败: %s\n%s" % (dst, p.stderr.decode("utf-8", "replace")))
 
 
+def main_data_bytes(data, f):
+    """一帧的主数据区字节数（帧头 4 + MPEG-1 立体声侧信息 32 + 可能的 CRC）。"""
+    return f["size"] - 4 - 32 - (0 if data[f["off"] + 1] & 1 else 2)
+
+
+def splice_safe(data, audio, keep):
+    """从第 keep 帧开始保留是否安全：比特池引用全都落在保留区内部。
+
+    保留区是原样拷贝的字节，所以只要每一帧借的字节都还在保留区里，解码出的
+    音乐就和没替换静音帧时逐位相同。第一帧还必须 main_data_begin == 0，
+    否则它借的是被替换掉的那段字节。
+    每帧最多借 511 字节，保留区攒够 511 字节后，后面所有帧都肯定安全。
+    """
+    if not 0 <= keep < len(audio) or audio[keep]["mdb"] != 0:
+        return False
+    avail = 0
+    for f in audio[keep:]:
+        if f["mdb"] > avail:
+            return False
+        avail += main_data_bytes(data, f)
+        if avail > 511:
+            break
+    return True
+
+
 def make_spliced(data, lead, donor):
-    """把前导静音里整帧都在静音区的帧换成低码率静音帧，返回 (字节, 替换帧数)。"""
+    """把前导静音里整帧都在静音区的帧换成低码率静音帧，返回 (字节, 替换帧数)。
+
+    分界点从「音乐开始前一帧」往前找，直到找到一个不借前文的帧（静音区里
+    这种帧到处都是），并逐帧确认保留区的比特池引用都在保留区内部。这样替换
+    掉的只有静音，音乐段和原编码逐位相同；找不到安全的分界点就直接报错。
+    """
     frames = mp3_frames(data)
     if not frames or not frames[0]["xing"]:
         raise RuntimeError("编码结果里没有 Xing/Info 帧（无法可靠对齐）")
     audio = frames[1:]
+    if not audio:
+        raise RuntimeError("编码结果里没有音频帧")
 
-    # 关掉比特池后，每一帧都必须是自包含的；否则替换静音帧会把音乐开头弄坏
-    if any(f["mdb"] for f in audio):
-        raise RuntimeError("比特池没关掉（-reservoir 0 没生效），不能替换静音帧")
+    # 只替换「就算编码器延迟到 1 帧，也肯定整帧都在静音里」的帧：
+    # 末尾至少留 1 帧整帧静音 + 音乐开始的那一帧，保证音乐起点不受影响。
+    keep = min(max(0, lead // MP3_SAMPLES - 1), len(audio) - 1)
+    while keep > 0 and not splice_safe(data, audio, keep):
+        keep -= 1
+    if not splice_safe(data, audio, keep):
+        raise RuntimeError("找不到不借前文的分界帧，替换静音帧会破坏音乐")
 
-    # 只替换"就算编码器延迟到 1 帧，也肯定整帧都在静音里"的帧：
-    # 末尾至少留 1 帧（实际会留 2 帧）原编码静音，保证音乐起点不受影响。
-    replaced = min(max(0, lead // MP3_SAMPLES - 1), len(audio))
     tag = data[frames[0]["off"]:frames[0]["off"] + frames[0]["size"]]
-    body = b"".join(data[f["off"]:f["off"] + f["size"]] for f in audio[replaced:])
-    return tag + donor * replaced + body, replaced
+    body = b"".join(data[f["off"]:f["off"] + f["size"]] for f in audio[keep:])
+    return tag + donor * keep + body, keep
 
 
 def fit_end(pcm, end, cap, bitrate, donor, dst):
